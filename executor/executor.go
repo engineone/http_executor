@@ -9,53 +9,36 @@ import (
 
 	"github.com/engineone/types"
 	"github.com/engineone/utils"
+	validate "github.com/go-playground/validator/v10"
 	"github.com/palantir/stacktrace"
-	"github.com/sergeyglazyrindev/govalidator"
 	"github.com/sirupsen/logrus"
 )
 
+type Input struct {
+	URL     string            `json:"url" valid:"required,url"`
+	Method  string            `json:"method" valid:"required,in(GET|POST|PUT|DELETE|PATCH|OPTIONS|HEAD)"`
+	Headers map[string]string `json:"headers" valid:"required,dictionary"`
+	Body    interface{}       `json:"body"`
+}
+
+type Output struct {
+	Headers map[string]string `json:"headers" valid:"required,dictionary"`
+	Body    interface{}       `json:"body"`
+}
+
 type HttpExecutor struct {
-	inputRules  map[string]interface{}
-	outputRules map[string]interface{}
+	validator  *validate.Validate
+	inputCache *Input
 }
 
 // NewHttpExecutor creates a new HttpExecutor
 func NewHttpExecutor() *HttpExecutor {
 	return &HttpExecutor{
-		// Example:
-		// --------
-		// url: http://localhost:8080
-		// method: POST
-		// headers:
-		// 	Content-Type: application/json
-		// body: |
-		// 	{
-		// 		"name": "John Doe",
-		// 		"age": 25
-		// 	}
-		inputRules: map[string]interface{}{
-			"url":     "required,url",
-			"method":  "required,in(GET|POST|PUT|DELETE|PATCH|OPTIONS|HEAD)",
-			"headers": "required,dictionary",
-			"body":    "",
-		},
-		// Example:
-		// --------
-		// headers:
-		// 	Content-Type: application/json
-		// body: |
-		// 	{
-		// 		"name": "John Doe",
-		// 		"age": 25
-		// 	}
-		outputRules: map[string]interface{}{
-			"headers": "required,dictionary",
-			"body":    "",
-		},
+		validator: utils.NewValidator(),
 	}
 }
 
-func (e *HttpExecutor) New() *HttpExecutor {
+func (e *HttpExecutor) New() types.Executor {
 	return NewHttpExecutor()
 }
 
@@ -68,37 +51,49 @@ func (e *HttpExecutor) Name() string {
 }
 
 func (e *HttpExecutor) InputRules() map[string]interface{} {
-	return e.inputRules
+	return utils.ExtractValidationRules(&Input{})
 }
 
 func (e *HttpExecutor) OutputRules() map[string]interface{} {
-	return e.outputRules
+	return utils.ExtractValidationRules(&Output{})
 }
 
 func (e *HttpExecutor) Description() string {
 	return "Http executor to make http requests to a given url with the given method and headers."
 }
 
+func (e *HttpExecutor) convertInput(input interface{}) (*Input, error) {
+	if e.inputCache != nil {
+		return e.inputCache, nil
+	}
+
+	e.inputCache = &Input{}
+	if err := utils.ConvertToStruct(input, e.inputCache); err != nil {
+		return nil, stacktrace.PropagateWithCode(err, types.ErrInvalidInput, "Error converting input to struct")
+	}
+	return e.inputCache, nil
+}
+
 func (e *HttpExecutor) Validate(ctx context.Context, task *types.Task, otherTasks []*types.Task) error {
 	if task.Input == nil {
-		return stacktrace.NewErrorWithCode(types.ErrInvalidTask, "Input is required")
+		return stacktrace.NewErrorWithCode(types.ErrInvalidInput, "Input is required")
 	}
 
-	input, ok := task.Input.(map[string]interface{})
-	if !ok {
-		return stacktrace.NewErrorWithCode(types.ErrInvalidTask, "Input must be an object")
+	input, err := e.convertInput(task.Input)
+	if err != nil {
+		return stacktrace.Propagate(err, "Failed to convert input")
 	}
 
-	_, err := govalidator.ValidateMap(input, e.inputRules)
-	return stacktrace.PropagateWithCode(err, types.ErrInvalidTask, "Input validation failed")
+	err = e.validator.Struct(input)
+	return stacktrace.PropagateWithCode(err, types.ErrInvalidInput, "Input validation failed")
 }
 
 func (e *HttpExecutor) Execute(ctx context.Context, task *types.Task, otherTasks []*types.Task) (interface{}, error) {
 	logrus.Debugf("Executing task %s in an http executor", task.ID)
 
-	input, ok := task.Input.(map[string]interface{})
-	if !ok {
-		return nil, stacktrace.NewErrorWithCode(types.ErrInvalidTask, "Input must be an object")
+	input, err := e.convertInput(task.Input)
+	if err != nil {
+		return nil, stacktrace.Propagate(err, "Failed to convert input")
 	}
 
 	// See if we need to render the tamplate input
@@ -118,33 +113,29 @@ func (e *HttpExecutor) Execute(ctx context.Context, task *types.Task, otherTasks
 		}
 	}
 
-	url, _ := input["url"].(string)
-	method, _ := input["method"].(string)
-
 	var req *http.Request
-	if method == "POST" || method == "PUT" || method == "PATCH" {
+	if input.Method == "POST" || input.Method == "PUT" || input.Method == "PATCH" {
 		var body io.Reader
-		bodyContent, ok := input["body"].(string)
+		bodyContent, ok := input.Body.(string)
 		if ok {
 			body = strings.NewReader(bodyContent)
 		} else {
-			bodyBytes, _ := json.Marshal(input["body"])
+			bodyBytes, _ := json.Marshal(bodyContent)
 			body = strings.NewReader(string(bodyBytes))
 		}
 
-		req, err = http.NewRequest(method, url, body)
+		req, err = http.NewRequest(input.Method, input.URL, body)
 	} else {
-		req, err = http.NewRequest(method, url, nil)
+		req, err = http.NewRequest(input.Method, input.URL, nil)
 	}
 
 	if err != nil {
 		return nil, stacktrace.Propagate(err, "Failed to create the http request")
 	}
 
-	headers, ok := input["headers"].(map[string]interface{})
-	if ok {
-		for key, value := range headers {
-			req.Header.Set(key, value.(string))
+	if input.Headers != nil {
+		for key, value := range input.Headers {
+			req.Header.Set(key, value)
 		}
 	}
 
